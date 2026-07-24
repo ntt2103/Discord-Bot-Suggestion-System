@@ -61,7 +61,7 @@ async def recommend(ctx, *, user_query: str):
     
     # 4. Hiển thị lên Discord bằng Embed
     embed = discord.Embed(
-        title="🎯 TOP 3 Gợi ý dành riêng cho bạn", 
+        title=" TOP 3 Gợi ý dành riêng cho bạn", 
         description=f"**Ý định hiểu được:**\n- Danh mục: `{category_key}`\n- Giá tối đa: `{max_price or 'Không giới hạn'} đ`\n- Từ khóa: `{', '.join(keywords)}`",
         color=discord.Color.green()
     )
@@ -82,10 +82,10 @@ async def recommend(ctx, *, user_query: str):
         short_name = (name[:75] + '...') if len(name) > 75 else name
         
         info = (
-            f"💰 **Giá:** {price:,.0f} đ\n"
-            f"🔥 **Giảm giá:** {discount}%\n"
-            f"⭐ **Điểm hệ thống:** {p.get('total_score'):,.0f} (Base: {p.get('base_score'):.0f} | Dynamic: {p.get('dynamic_score'):.0f})\n"
-            f"[👉 Bấm vào đây để xem chi tiết]({link})"
+            f" **Giá:** {price:,.0f} đ\n"
+            f" **Giảm giá:** {discount}%\n"
+            f" **Điểm hệ thống:** {p.get('total_score'):,.0f} (Base: {p.get('base_score'):.0f} | Dynamic: {p.get('dynamic_score'):.0f})\n"
+            f"[ Bấm vào đây để xem chi tiết]({link})"
         )
         
         embed.add_field(name=f"#{i+1} - {short_name}", value=info, inline=False)
