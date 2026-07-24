@@ -8,6 +8,23 @@ import io
 from botocore.exceptions import ClientError
 import concurrent.futures
 from pathlib import Path
+import os
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=os.environ.get('MINIO_URL', 'http://localhost:9000'),     
+    aws_access_key_id='admin',    
+    aws_secret_access_key='password123', 
+    region_name='us-east-1'                   
+)
+BUCKET_NAME = 'tiki-data-raw'
+
+def init_minio():
+    try:
+        s3_client.head_bucket(Bucket=BUCKET_NAME)
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            s3_client.create_bucket(Bucket=BUCKET_NAME)
 
 categories_crawl = [
     {'urlKey': 'tai-nghe-co-day', 'category': '1804'},
@@ -143,7 +160,11 @@ def crawl_single_category(cat):
             response = requests.get('https://tiki.vn/api/personalish/v1/blocks/listings', headers=headers, params=params, cookies=cookies)
             
             if response.status_code == 200:
-                data = response.json().get('data')
+                try:
+                    data = response.json().get('data')
+                except Exception as e:
+                    print(f"[{current_urlKey}] Lỗi parse JSON ở trang {i}: {e}. Nội dung trả về: {response.text[:200]}")
+                    break
                 
                 # Hết data thì thoát vòng lặp trang
                 if not data:
@@ -167,15 +188,18 @@ def crawl_single_category(cat):
         df = pd.DataFrame(product_id)
         current_date = datetime.now().strftime("%d%m%y")
         
-        # Tạo đường dẫn thư mục và tự động tạo folder nếu chưa tồn tại
-        output_dir = Path('data/raw/crawled_id')
-        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_buffer = df.to_csv(index=False).encode('utf-8')
+        object_key = f'crawled_ids/product_id_{current_urlKey}_{current_date}.csv'
         
-        # Tạo đường dẫn file hoàn chỉnh
-        file_name = output_dir / f'product_id_{current_urlKey}_{current_date}.csv'
-        
-        df.to_csv(file_name, index=False)
-        print(f"[{current_urlKey}] -> Đã lưu xong file: {file_name}")
+        try:
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key=object_key,
+                Body=csv_buffer
+            )
+            print(f"[{current_urlKey}] -> Đã lưu xong file lên MinIO: {object_key}")
+        except Exception as e:
+            print(f"[{current_urlKey}] -> Lỗi lưu file lên MinIO: {e}")
         
     # Nghỉ ngơi một chút trước khi thread này nhận nhiệm vụ (danh mục) mới
     time.sleep(random.randrange(5, 10))
@@ -190,6 +214,8 @@ if __name__ == '__main__':
     MAX_THREADS = 4 
     
     print(f"Bắt đầu khởi chạy {MAX_THREADS} luồng song song...")
+    
+    init_minio()
     
     # Bắt đầu giao việc cho các luồng
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:

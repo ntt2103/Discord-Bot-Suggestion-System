@@ -1,0 +1,19 @@
+FROM apache/airflow:2.8.1-python3.10
+
+USER root
+# Cài đặt Java (JRE) để có thể chạy PySpark bên trong Docker
+RUN apt-get update \
+    && apt-get install -y default-jre-headless \
+    && apt-get autoremove -yqq --purge \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+USER airflow
+# Cài đặt các thư viện Python dùng trong crawler và PySpark
+RUN pip install --default-timeout=1000 --no-cache-dir \
+    pyspark==3.5.0 \
+    boto3 \
+    requests \
+    beautifulsoup4 \
+    pandas \
+    psycopg2-binary

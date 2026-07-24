@@ -3,11 +3,32 @@ import requests
 import time
 import random
 import sys
+import boto3
+import io
+import os
+from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from requests import RequestException
 from tqdm import tqdm
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=os.environ.get('MINIO_URL', 'http://localhost:9000'),     
+    aws_access_key_id='admin',    
+    aws_secret_access_key='password123', 
+    region_name='us-east-1'                   
+)
+BUCKET_NAME = 'tiki-data-raw'
+
+def init_minio():
+    try:
+        s3_client.head_bucket(Bucket=BUCKET_NAME)
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            print(f"Tạo bucket {BUCKET_NAME}...")
+            s3_client.create_bucket(Bucket=BUCKET_NAME)
 
 cookies = {
     'TIKI_GUEST_TOKEN': 'Cn1sZNr2UaBc3QWxuVI8XSGYb4EADdqw',
@@ -66,8 +87,8 @@ params = (
 )
 
 
-OUTPUT_PATH = Path('crawled_data_ncds.csv')
-FAILED_PATH = Path('failed_product_ids.csv')
+
+MAX_WORKERS = 3
 MAX_WORKERS = 3
 SAVE_EVERY = 20
 REQUEST_DELAY_RANGE = (0.8, 2.0)
@@ -145,64 +166,73 @@ def crawl_one(pid):
     return None, {'id': pid, 'error': error}
 
 
-def save_rows(rows, output_path):
+def save_rows(rows, output_key):
     if not rows:
         return None
 
     df_product = pd.DataFrame(rows).drop_duplicates(subset=['id'])
-    try:
-        df_product.to_csv(output_path, index=False, encoding='utf-8-sig')
-        return output_path
-    except PermissionError:
-        fallback_path = Path('crawled_data_ncds_{}.csv'.format(datetime.now().strftime('%Y%m%d_%H%M%S')))
-        df_product.to_csv(fallback_path, index=False, encoding='utf-8-sig')
-        print('File {} is being used. Saved to {} instead.'.format(output_path, fallback_path))
-        return fallback_path
+    csv_buffer = df_product.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+    
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=output_key,
+        Body=csv_buffer
+    )
+    return output_key
 
 # Định nghĩa lại số lượng luồng để tránh bị khóa IP
 MAX_CONCURRENT_FILES = 2  # Số lượng file chạy song song cùng lúc
 MAX_WORKERS_PER_FILE = 3  # Số lượng sản phẩm chạy song song trong 1 file
 
-def process_single_file(input_path, output_dir):
+def process_single_file(input_key):
     """
     Hàm xử lý độc lập cho 1 file duy nhất. 
     Sẽ được gọi đồng thời bởi ThreadPoolExecutor trong main()
     """
-    base_name = input_path.stem.replace('product_id_', '')
-    output_file_path = output_dir / 'crawled_{}.csv'.format(base_name)
-    failed_file_path = output_dir / 'failed_{}.csv'.format(base_name)
+    file_name = input_key.split('/')[-1]
+    base_name = file_name.replace('product_id_', '').replace('.csv', '')
     
-    # Đọc file ID hiện tại
+    output_key = f'crawled_products/crawled_{base_name}.csv'
+    failed_key = f'crawled_products/failed_{base_name}.csv'
+    
+    # Đọc file ID hiện tại từ MinIO
     try:
-        df_id = pd.read_csv(input_path)
+        response = s3_client.get_object(Bucket=BUCKET_NAME, Key=input_key)
+        df_id = pd.read_csv(response['Body'])
     except Exception as e:
-        print(f'[{input_path.name}] Lỗi đọc file: {e}')
+        print(f'[{file_name}] Lỗi đọc file từ MinIO: {e}')
         return
 
     if 'id' not in df_id.columns:
-        print(f'[{input_path.name}] Không có cột "id", bỏ qua...')
+        print(f'[{file_name}] Không có cột "id", bỏ qua...')
         return
         
     p_ids = df_id['id'].dropna().drop_duplicates().tolist()
     result = []
     failed = []
     
-    # Kiểm tra tính liên tục (Resume)
-    if output_file_path.exists():
-        old_df = pd.read_csv(output_file_path)
+    # Kiểm tra tính liên tục (Resume) trên MinIO
+    try:
+        old_response = s3_client.get_object(Bucket=BUCKET_NAME, Key=output_key)
+        old_df = pd.read_csv(old_response['Body'])
         if REQUIRED_COLUMNS.issubset(old_df.columns):
             result = old_df.to_dict('records')
             crawled_ids = set(old_df['id'].dropna().tolist())
             p_ids = [pid for pid in p_ids if pid not in crawled_ids]
-            print(f'[{input_path.name}] Resume: Đã có {len(result)} sp, còn lại {len(p_ids)}.')
+            print(f'[{file_name}] Resume: Đã có {len(result)} sp, còn lại {len(p_ids)}.')
         elif 'id' in old_df.columns:
-            print(f'[{input_path.name}] CSV cũ thiếu cột. Crawl lại {len(p_ids)} IDs.')
+            print(f'[{file_name}] CSV cũ thiếu cột. Crawl lại {len(p_ids)} IDs.')
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            pass
+        else:
+            print(f"[{file_name}] Lỗi khi check output cũ: {e}")
 
     if not p_ids:
-        print(f'[{input_path.name}] Đã crawl hoàn tất từ trước. Bỏ qua!')
+        print(f'[{file_name}] Đã crawl hoàn tất từ trước. Bỏ qua!')
         return
 
-    print(f'>>> BẮT ĐẦU CRAWL FILE: {input_path.name} ({len(p_ids)} sản phẩm)')
+    print(f'>>> BẮT ĐẦU CRAWL FILE: {file_name} ({len(p_ids)} sản phẩm)')
 
     # Chạy đa luồng cho các sản phẩm trong file này
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_PER_FILE) as executor:
@@ -226,15 +256,17 @@ def process_single_file(input_path, output_dir):
 
             # Lưu định kỳ
             if index % SAVE_EVERY == 0:
-                save_rows(result, output_file_path)
+                save_rows(result, output_key)
                 print(f'[{base_name}] Đã quét {index}/{len(p_ids)} sản phẩm...')
 
     # Lưu chốt lại khi hoàn thành 1 file
-    saved_path = save_rows(result, output_file_path)
+    saved_path = save_rows(result, output_key)
     
     if failed:
-        pd.DataFrame(failed).to_csv(failed_file_path, index=False, encoding='utf-8-sig')
-        print(f'[{base_name}] Đã lưu {len(failed)} IDs lỗi vào {failed_file_path.name}')
+        df_failed = pd.DataFrame(failed)
+        csv_buffer = df_failed.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+        s3_client.put_object(Bucket=BUCKET_NAME, Key=failed_key, Body=csv_buffer)
+        print(f'[{base_name}] Đã lưu {len(failed)} IDs lỗi vào {failed_key}')
         
     if saved_path:
         final_count = len(pd.DataFrame(result).drop_duplicates(subset=['id']))
@@ -242,28 +274,28 @@ def process_single_file(input_path, output_dir):
 
 
 def main():
-    # Định nghĩa các thư mục
-    input_dir = Path('data/raw/crawled_id')
-    output_dir = Path('data/raw/crawled_product')
+    init_minio()
     
-    # Tự động tạo thư mục đầu ra nếu chưa tồn tại
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Tìm tất cả các file đầu vào trong thư mục input_dir
-    input_files = list(input_dir.glob('product_id_*.csv'))
-    
-    if not input_files:
-        print(f"Không tìm thấy file danh sách ID nào trong {input_dir}!")
+    # Liệt kê tất cả các file từ thư mục crawled_ids trên MinIO
+    response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix='crawled_ids/')
+    if 'Contents' not in response:
+        print("Không tìm thấy file danh sách ID nào trên MinIO!")
         return
         
-    print(f'Tìm thấy {len(input_files)} file danh mục cần xử lý.')
+    input_keys = [obj['Key'] for obj in response['Contents'] if obj['Key'].endswith('.csv')]
+    
+    if not input_keys:
+        print("Không tìm thấy file danh sách ID định dạng .csv nào trên MinIO!")
+        return
+        
+    print(f'Tìm thấy {len(input_keys)} file danh mục cần xử lý.')
     print(f'Đang cấu hình chạy song song {MAX_CONCURRENT_FILES} file cùng lúc...')
     print('======================================================\n')
 
     # Dùng ThreadPoolExecutor để chạy song song các file
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FILES) as executor:
         # Submit tất cả các file vào pool
-        futures = [executor.submit(process_single_file, input_path, output_dir) for input_path in input_files]
+        futures = [executor.submit(process_single_file, input_key) for input_key in input_keys]
         
         # Đợi các file hoàn thành (Không bắt buộc phải có, nhưng giúp catch error tổng)
         for future in as_completed(futures):
