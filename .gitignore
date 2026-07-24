@@ -11,7 +11,7 @@ __pycache__/
 .agents/
 
 # Data directory (uncomment or adjust if data files should be tracked)
-# data/
+data/
 
 # Environment files
 .env
